@@ -1,11 +1,20 @@
 import { createSudokuFromJSON } from './Sudoku.js'
 
 /**
- * 使用 JSON 的方式做深拷贝。
- * 本项目里保存的快照都是普通对象和数组，所以这种方式够用。
+ * Game 领域对象。
+ *
+ * Sudoku 只关心“盘面”，Game 关心“一局游戏”：
+ * - 普通模式下的 undo / redo
+ * - 探索模式下的临时分支
+ * - 探索失败路径的记录与检测
+ * - 提示功能的统一入口
+ */
+
+/**
+ * 使用 JSON 的方式深拷贝普通数据。
  *
  * @param {any} value 要复制的数据
- * @returns {any} 复制后的新数据
+ * @returns {any} 深拷贝后的数据
  */
 function deepCopy(value) {
   return JSON.parse(JSON.stringify(value))
@@ -13,721 +22,424 @@ function deepCopy(value) {
 
 /**
  * 复制一组历史快照。
- * undoStack / redoStack / exploreStack 里保存的都是 Sudoku 的 JSON 快照。
  *
  * @param {Array<Object>} list 快照数组
- * @returns {Array<Object>} 复制后的快照数组
+ * @returns {Array<Object>} 新数组
  */
 function copySnapshotList(list) {
-  return list.map((item) => deepCopy(item))
+  return Array.isArray(list) ? list.map((item) => deepCopy(item)) : []
 }
 
 /**
- * 判断两个快照是否相同。
- * 这里用于提交 Explore 时判断棋盘有没有真的发生变化。
+ * 把数字坐标标准化成 row / col。
+ * UI 中常用 x/y，领域层常用 row/col，这里统一转换。
  *
- * @param {Object} a 快照 A
- * @param {Object} b 快照 B
- * @returns {boolean} 是否相同
+ * @param {{row?: number, col?: number, x?: number, y?: number}} pos 坐标对象
+ * @returns {{row: number, col: number}} 标准坐标
  */
-function isSameSnapshot(a, b) {
-  return JSON.stringify(a) === JSON.stringify(b)
+function normalizePosition(pos) {
+  return {
+    row: Number.isInteger(pos?.row) ? pos.row : pos?.y,
+    col: Number.isInteger(pos?.col) ? pos.col : pos?.x,
+  }
+}
+
+/**
+ * 创建一个用于显示的状态对象。
+ *
+ * @param {string} mode 当前模式
+ * @param {boolean} failed 是否失败
+ * @param {string} message 提示消息
+ * @returns {{mode: string, failed: boolean, message: string}}
+ */
+function createStatus(mode, failed, message) {
+  return { mode, failed, message }
 }
 
 /**
  * 创建 Game 对象的内部函数。
  *
- * Game 负责：
- * 1. 持有当前 Sudoku
- * 2. 管理普通模式下的 Undo / Redo
- * 3. 管理 Explore 模式下的独立 Undo / Redo
- * 4. 提供 Hint 相关接口
- * 5. 记录失败的探索路径
- *
  * @param {Object} options 配置对象
- * @param {Object} options.sudoku 当前数独对象
- * @param {Array<Object>} [options.undoStack=[]] 普通 undo 历史
- * @param {Array<Object>} [options.redoStack=[]] 普通 redo 历史
- * @param {'normal'|'explore'} [options.mode='normal'] 当前模式
- * @param {Object|null} [options.exploreBaseSnapshot=null] 探索起点快照
- * @param {Array<Object>} [options.exploreUndoStack=[]] 探索 undo 历史
- * @param {Array<Object>} [options.exploreRedoStack=[]] 探索 redo 历史
- * @param {Array<string>} [options.failedExploreSignatures=[]] 已失败探索局面签名
+ * @param {Object} options.sudoku 当前主线数独
+ * @param {Array<Object>} [options.undoStack=[]] 主线 undo 历史
+ * @param {Array<Object>} [options.redoStack=[]] 主线 redo 历史
+ * @param {string[]} [options.failedBoardKeys=[]] 已知失败探索局面
+ * @param {Object|null} [options.exploration=null] 探索模式数据
  * @returns {Object} Game 对象
  */
 function createGameInternal({
   sudoku,
   undoStack = [],
   redoStack = [],
-  mode = 'normal',
-  exploreBaseSnapshot = null,
-  exploreUndoStack = [],
-  exploreRedoStack = [],
-  failedExploreSignatures = [],
+  failedBoardKeys = [],
+  exploration = null,
 }) {
   if (!sudoku || typeof sudoku.clone !== 'function' || typeof sudoku.toJSON !== 'function') {
     throw new Error('createGame requires a valid sudoku object.')
   }
 
-  /** 当前真正使用的 Sudoku 对象 */
+  /** @type {Object} 普通模式的主线盘面。 */
   let currentSudoku = sudoku.clone()
 
-  /** 普通模式 undo 栈 */
+  /** @type {Array<Object>} 普通模式 undo 栈。 */
   let undoStackData = copySnapshotList(undoStack)
 
-  /** 普通模式 redo 栈 */
+  /** @type {Array<Object>} 普通模式 redo 栈。 */
   let redoStackData = copySnapshotList(redoStack)
 
-  /**
-   * 当前 Game 模式。
-   * normal：正常填写
-   * explore：探索模式
-   */
-  let gameMode = mode === 'explore' ? 'explore' : 'normal'
+  /** @type {Set<string>} 已经证明失败的探索局面。 */
+  const failedBoardKeySet = new Set(failedBoardKeys)
 
   /**
-   * 探索模式开始时的棋盘快照。
-   * 放弃探索时，回到这个快照。
-   * 提交探索时，把这个快照压入普通 undo 栈。
-   */
-  let exploreBaseSnapshotData = exploreBaseSnapshot === null
-    ? null
-    : deepCopy(exploreBaseSnapshot)
-
-  /** 探索模式独立 undo 栈 */
-  let exploreUndoStackData = copySnapshotList(exploreUndoStack)
-
-  /** 探索模式独立 redo 栈 */
-  let exploreRedoStackData = copySnapshotList(exploreRedoStack)
-
-  /**
-   * 失败探索路径记忆。
-   * 用 Set 是因为我们只关心某个棋盘签名是否已经失败过。
-   */
-  let failedExploreSignaturesData = new Set(
-    Array.isArray(failedExploreSignatures) ? failedExploreSignatures : []
-  )
-
-  /**
-   * 如果从 JSON 恢复时 mode 是 explore，
-   * 但没有 exploreBaseSnapshot，则自动把当前局面作为探索起点。
-   */
-  if (gameMode === 'explore' && exploreBaseSnapshotData === null) {
-    exploreBaseSnapshotData = currentSudoku.toJSON()
-  }
-
-  /**
-   * 获取当前数独对象的副本。
-   * 返回 clone，防止 UI 或外部代码直接修改 Game 内部状态。
+   * 探索模式状态。
+   * 为 null 表示当前不是探索模式。
    *
-   * @returns {Object} 当前 Sudoku 的副本
+   * @type {{sudoku: Object, undoStack: Array<Object>, redoStack: Array<Object>, base: Object}|null}
    */
-  function getSudoku() {
-    return currentSudoku.clone()
-  }
+  let explorationData = exploration
+    ? {
+        sudoku: createSudokuFromJSON(exploration.sudoku),
+        undoStack: copySnapshotList(exploration.undoStack),
+        redoStack: copySnapshotList(exploration.redoStack),
+        base: deepCopy(exploration.base),
+      }
+    : null
 
   /**
-   * 获取当前游戏模式。
+   * 获取当前正在操作的状态。
+   * 探索模式下操作探索盘面；普通模式下操作主线盘面。
    *
-   * @returns {'normal'|'explore'} 当前模式
+   * @returns {{sudoku: Object, undoStack: Array<Object>, redoStack: Array<Object>}}
    */
-  function getMode() {
-    return gameMode
-  }
+  function getActiveState() {
+    if (explorationData) return explorationData
 
-  /**
-   * 判断当前是否处于探索模式。
-   *
-   * @returns {boolean} 是否正在探索
-   */
-  function isExploring() {
-    return gameMode === 'explore'
-  }
-
-  /**
-   * 获取当前棋盘签名。
-   * 用于失败探索路径记忆。
-   *
-   * @returns {string} 当前棋盘签名
-   */
-  function getCurrentBoardSignature() {
-    if (typeof currentSudoku.getBoardSignature === 'function') {
-      return currentSudoku.getBoardSignature()
+    return {
+      sudoku: currentSudoku,
+      undoStack: undoStackData,
+      redoStack: redoStackData,
     }
-
-    return JSON.stringify(currentSudoku.getGrid())
   }
 
   /**
-   * 分析当前局面是否是失败探索局面。
+   * 把 active state 中的栈写回真实变量。
+   * 普通模式下 getActiveState 返回的是临时对象，所以改完栈后需要同步。
    *
-   * 失败包括三种：
-   * 1. 当前局面以前已经被记录为失败
-   * 2. 当前棋盘存在冲突
-   * 3. 当前棋盘出现了没有候选数的空格
-   *
-   * @returns {Object} 失败分析结果
+   * @param {{sudoku: Object, undoStack: Array<Object>, redoStack: Array<Object>}} active 当前活动状态
    */
-  function analyzeCurrentFailure() {
-    const signature = getCurrentBoardSignature()
+  function saveActiveState(active) {
+    if (explorationData) {
+      explorationData.sudoku = active.sudoku
+      explorationData.undoStack = active.undoStack
+      explorationData.redoStack = active.redoStack
+    } else {
+      currentSudoku = active.sudoku
+      undoStackData = active.undoStack
+      redoStackData = active.redoStack
+    }
+  }
 
-    if (failedExploreSignaturesData.has(signature)) {
+  /**
+   * 判断当前局面是否是失败探索局面。
+   * 如果盘面本身冲突，会记录为失败路径；如果盘面 key 已经记录过，也会提示失败。
+   *
+   * @param {Object} sudokuToCheck 要检查的数独对象
+   * @returns {{failed: boolean, message: string}}
+   */
+  function checkFailedBoard(sudokuToCheck) {
+    const boardKey = sudokuToCheck.getBoardKey()
+
+    if (!sudokuToCheck.isValidBoard()) {
+      failedBoardKeySet.add(boardKey)
       return {
         failed: true,
-        reason: 'knownFailedPath',
-        signature,
-        message: 'This board was already recorded as a failed explore path.',
+        message: '探索失败：当前盘面出现同行、同列或同宫冲突。可以撤销，或放弃本次探索。',
       }
     }
 
-    if (
-      typeof currentSudoku.hasConflict === 'function' &&
-      currentSudoku.hasConflict()
-    ) {
+    if (failedBoardKeySet.has(boardKey)) {
       return {
         failed: true,
-        reason: 'conflict',
-        signature,
-        conflictCells:
-          typeof currentSudoku.getConflictCells === 'function'
-            ? currentSudoku.getConflictCells()
-            : [],
-        message: 'The current explore board has conflicts.',
-      }
-    }
-
-    if (typeof currentSudoku.getNextHint === 'function') {
-      const hint = currentSudoku.getNextHint()
-
-      if (hint && hint.type === 'contradiction') {
-        return {
-          failed: true,
-          reason: 'contradiction',
-          signature,
-          hint,
-          message: 'The current explore board has an empty cell with no legal candidate.',
-        }
+        message: '探索失败：你又走到了一个之前已经失败过的局面。建议回退并换一条路径。',
       }
     }
 
     return {
       failed: false,
-      reason: null,
-      signature,
-      message: 'The current board is not known as a failed explore path.',
+      message: explorationData
+        ? '探索中：当前分支暂时没有冲突。可以继续尝试、提交或放弃。'
+        : '',
     }
   }
 
   /**
-   * 如果当前探索局面已经失败，就把它记录进失败路径集合。
+   * 获取当前显示给玩家看的数独。
+   * 探索模式下返回探索分支，否则返回主线盘面。
    *
-   * @returns {boolean} 是否记录了失败路径
+   * @returns {Object} 当前数独副本
    */
-  function rememberFailedExploreIfNeeded() {
-    const failure = analyzeCurrentFailure()
-
-    if (
-      failure.failed &&
-      failure.reason !== 'knownFailedPath' &&
-      failure.signature
-    ) {
-      failedExploreSignaturesData.add(failure.signature)
-      return true
-    }
-
-    return false
+  function getSudoku() {
+    return getActiveState().sudoku.clone()
   }
 
   /**
-   * 执行一次填数操作。
-   *
-   * 普通模式：
-   * - 使用普通 undoStack / redoStack
-   *
-   * 探索模式：
-   * - 使用 exploreUndoStack / exploreRedoStack
-   * - 不污染主历史
+   * 执行一次填数。
    *
    * @param {Object} move 一次操作的信息
    * @returns {boolean} 是否修改成功
    */
   function guess(move) {
-    const oldSnapshot = currentSudoku.toJSON()
-    const success = currentSudoku.guess(move)
+    const active = getActiveState()
+    const oldSnapshot = active.sudoku.toJSON()
+    const success = active.sudoku.guess(move)
 
-    if (!success) {
-      return false
-    }
+    if (!success) return false
 
-    if (isExploring()) {
-      exploreUndoStackData.push(oldSnapshot)
-      exploreRedoStackData = []
-      rememberFailedExploreIfNeeded()
-    } else {
-      undoStackData.push(oldSnapshot)
-      redoStackData = []
+    active.undoStack.push(oldSnapshot)
+    active.redoStack = []
+    saveActiveState(active)
+
+    if (explorationData) {
+      checkFailedBoard(explorationData.sudoku)
     }
 
     return true
   }
 
   /**
-   * 撤销上一步操作。
-   *
-   * 普通模式下撤销普通历史；
-   * 探索模式下撤销探索历史。
+   * 撤销上一步。
+   * 探索模式下只撤销探索分支，不影响主线历史。
    *
    * @returns {boolean} 是否撤销成功
    */
   function undo() {
-    if (isExploring()) {
-      if (exploreUndoStackData.length === 0) {
-        return false
-      }
+    const active = getActiveState()
 
-      const currentSnapshot = currentSudoku.toJSON()
-      exploreRedoStackData.push(currentSnapshot)
+    if (active.undoStack.length === 0) return false
 
-      const previousSnapshot = exploreUndoStackData.pop()
-      currentSudoku = createSudokuFromJSON(previousSnapshot)
-
-      return true
-    }
-
-    if (undoStackData.length === 0) {
-      return false
-    }
-
-    const currentSnapshot = currentSudoku.toJSON()
-    redoStackData.push(currentSnapshot)
-
-    const previousSnapshot = undoStackData.pop()
-    currentSudoku = createSudokuFromJSON(previousSnapshot)
-
+    active.redoStack.push(active.sudoku.toJSON())
+    active.sudoku = createSudokuFromJSON(active.undoStack.pop())
+    saveActiveState(active)
     return true
   }
 
   /**
-   * 重做上一次被撤销的操作。
-   *
-   * 普通模式下重做普通历史；
-   * 探索模式下重做探索历史。
+   * 重做一步。
+   * 探索模式下只重做探索分支。
    *
    * @returns {boolean} 是否重做成功
    */
   function redo() {
-    if (isExploring()) {
-      if (exploreRedoStackData.length === 0) {
-        return false
-      }
+    const active = getActiveState()
 
-      const currentSnapshot = currentSudoku.toJSON()
-      exploreUndoStackData.push(currentSnapshot)
+    if (active.redoStack.length === 0) return false
 
-      const nextSnapshot = exploreRedoStackData.pop()
-      currentSudoku = createSudokuFromJSON(nextSnapshot)
+    active.undoStack.push(active.sudoku.toJSON())
+    active.sudoku = createSudokuFromJSON(active.redoStack.pop())
+    saveActiveState(active)
+    return true
+  }
 
-      rememberFailedExploreIfNeeded()
-      return true
+  /**
+   * 判断当前模式下是否可以撤销。
+   *
+   * @returns {boolean} 是否可以撤销
+   */
+  function canUndo() {
+    return getActiveState().undoStack.length > 0
+  }
+
+  /**
+   * 判断当前模式下是否可以重做。
+   *
+   * @returns {boolean} 是否可以重做
+   */
+  function canRedo() {
+    return getActiveState().redoStack.length > 0
+  }
+
+  /**
+   * 进入探索模式。
+   * 探索分支会从当前主线盘面复制一份，之后的尝试不会直接污染主线。
+   *
+   * @returns {boolean} 是否成功进入探索模式
+   */
+  function enterExplore() {
+    if (explorationData) return false
+
+    explorationData = {
+      sudoku: currentSudoku.clone(),
+      undoStack: [],
+      redoStack: [],
+      base: currentSudoku.toJSON(),
     }
-
-    if (redoStackData.length === 0) {
-      return false
-    }
-
-    const currentSnapshot = currentSudoku.toJSON()
-    undoStackData.push(currentSnapshot)
-
-    const nextSnapshot = redoStackData.pop()
-    currentSudoku = createSudokuFromJSON(nextSnapshot)
 
     return true
   }
 
   /**
-   * 判断当前是否可以撤销。
+   * 提交探索结果。
+   * 只有探索分支没有失败时，才允许把分支合并到主线。
    *
-   * @returns {boolean} 是否可以 undo
+   * @returns {boolean} 是否提交成功
    */
-  function canUndo() {
-    return isExploring()
-      ? exploreUndoStackData.length > 0
-      : undoStackData.length > 0
+  function commitExplore() {
+    if (!explorationData) return false
+
+    const status = checkFailedBoard(explorationData.sudoku)
+    if (status.failed) return false
+
+    undoStackData.push(currentSudoku.toJSON())
+    redoStackData = []
+    currentSudoku = explorationData.sudoku.clone()
+    explorationData = null
+    return true
   }
 
   /**
-   * 判断当前是否可以重做。
+   * 放弃探索结果，回到进入探索前的主线局面。
    *
-   * @returns {boolean} 是否可以 redo
+   * @returns {boolean} 是否成功放弃探索
    */
-  function canRedo() {
-    return isExploring()
-      ? exploreRedoStackData.length > 0
-      : redoStackData.length > 0
+  function discardExplore() {
+    if (!explorationData) return false
+
+    checkFailedBoard(explorationData.sudoku)
+    explorationData = null
+    return true
   }
 
   /**
-   * 获取某个格子的候选数。
-   * 具体候选数计算交给 Sudoku，Game 只是作为 UI 的入口。
+   * 当前是否处于探索模式。
    *
-   * @param {number} row 行号
-   * @param {number} col 列号
+   * @returns {boolean} 是否探索中
+   */
+  function isExploring() {
+    return explorationData !== null
+  }
+
+  /**
+   * 当前探索分支是否已经失败。
+   *
+   * @returns {boolean} 是否失败
+   */
+  function isExploreFailed() {
+    if (!explorationData) return false
+    return checkFailedBoard(explorationData.sudoku).failed
+  }
+
+  /**
+   * 返回探索模式状态，用于 UI 显示。
+   *
+   * @returns {{mode: string, failed: boolean, message: string}} 状态对象
+   */
+  function getExploreStatus() {
+    if (!explorationData) {
+      return createStatus('normal', false, '')
+    }
+
+    const result = checkFailedBoard(explorationData.sudoku)
+    return createStatus('explore', result.failed, result.message)
+  }
+
+  /**
+   * 获取某格候选数。
+   *
+   * @param {{row?: number, col?: number, x?: number, y?: number}} pos 坐标
    * @returns {number[]} 候选数
    */
-  function getCandidates(row, col) {
-    return currentSudoku.getCandidates(row, col)
-  }
-
-  /**
-   * 获取某个格子的提示信息。
-   *
-   * @param {number} row 行号
-   * @param {number} col 列号
-   * @returns {Object} 提示信息
-   */
-  function getHintForCell(row, col) {
-    return currentSudoku.getHintForCell(row, col)
+  function getCandidates(pos) {
+    const { row, col } = normalizePosition(pos)
+    return getActiveState().sudoku.getCandidates(row, col)
   }
 
   /**
    * 获取下一步提示。
    *
-   * 可能返回：
-   * - conflict
-   * - contradiction
-   * - singleCandidate
-   * - explore
-   * - complete
-   *
-   * @returns {Object|null} 下一步提示
+   * @returns {Object} 提示对象
    */
-  function getNextHint() {
-    return currentSudoku.getNextHint()
+  function getHint() {
+    return deepCopy(getActiveState().sudoku.findNextHint())
   }
 
   /**
-   * 获取整个棋盘的候选数表。
+   * 返回已经记录的失败局面 key。
    *
-   * @returns {number[][][]} 9x9 候选数表
+   * @returns {string[]} 失败局面 key 列表
    */
-  function getCandidateMap() {
-    return currentSudoku.getCandidateMap()
+  function getFailedBoardKeys() {
+    return Array.from(failedBoardKeySet)
   }
 
   /**
-   * 自动应用下一步唯一候选数提示。
-   * 只有 getNextHint() 返回 singleCandidate 时才会真正填写。
+   * 把游戏状态转成普通 JSON。
    *
-   * @returns {boolean} 是否成功填写
-   */
-  function applyNextHint() {
-    const hint = getNextHint()
-
-    if (!hint || hint.type !== 'singleCandidate') {
-      return false
-    }
-
-    return guess({
-      row: hint.row,
-      col: hint.col,
-      value: hint.value,
-    })
-  }
-
-  /**
-   * 进入探索模式。
-   *
-   * 进入时保存当前局面作为探索起点。
-   * 探索过程中的输入不会直接进入主历史。
-   *
-   * @returns {boolean} 是否成功进入探索模式
-   */
-  function startExplore() {
-    if (isExploring()) {
-      return false
-    }
-
-    gameMode = 'explore'
-    exploreBaseSnapshotData = currentSudoku.toJSON()
-    exploreUndoStackData = []
-    exploreRedoStackData = []
-
-    return true
-  }
-
-  /**
-   * startExplore 的别名。
-   * 这样 UI 里想叫 enterExplore 也可以。
-   *
-   * @returns {boolean} 是否成功进入探索模式
-   */
-  function enterExplore() {
-    return startExplore()
-  }
-
-  /**
-   * 将探索局面重置回探索起点。
-   * 这个方法用于“快速回到探索开始处，换另一个候选值试”。
-   *
-   * @returns {boolean} 是否成功重置
-   */
-  function resetExploreToStart() {
-    if (!isExploring() || exploreBaseSnapshotData === null) {
-      return false
-    }
-
-    currentSudoku = createSudokuFromJSON(exploreBaseSnapshotData)
-    exploreUndoStackData = []
-    exploreRedoStackData = []
-
-    return true
-  }
-
-  /**
-   * 判断当前探索结果是否可以提交。
-   * 失败路径不能提交。
-   *
-   * @returns {boolean} 是否可以提交探索结果
-   */
-  function canCommitExplore() {
-    if (!isExploring()) {
-      return false
-    }
-
-    const failure = analyzeCurrentFailure()
-    return !failure.failed
-  }
-
-  /**
-   * 提交探索结果。
-   *
-   * 提交后：
-   * 1. 当前探索局面变成主局面
-   * 2. 探索起点进入普通 undo 栈
-   * 3. 普通 redo 栈清空
-   * 4. 退出探索模式
-   *
-   * @returns {boolean} 是否提交成功
-   */
-  function commitExplore() {
-    if (!isExploring() || exploreBaseSnapshotData === null) {
-      return false
-    }
-
-    const failure = analyzeCurrentFailure()
-
-    if (failure.failed) {
-      rememberFailedExploreIfNeeded()
-      return false
-    }
-
-    const currentSnapshot = currentSudoku.toJSON()
-
-    if (!isSameSnapshot(currentSnapshot, exploreBaseSnapshotData)) {
-      undoStackData.push(deepCopy(exploreBaseSnapshotData))
-      redoStackData = []
-    }
-
-    gameMode = 'normal'
-    exploreBaseSnapshotData = null
-    exploreUndoStackData = []
-    exploreRedoStackData = []
-
-    return true
-  }
-
-  /**
-   * 放弃探索结果。
-   *
-   * 放弃后：
-   * 1. 如果当前探索局面失败，则记录失败路径
-   * 2. 当前棋盘回到探索起点
-   * 3. 退出探索模式
-   *
-   * @returns {boolean} 是否成功放弃探索
-   */
-  function cancelExplore() {
-    if (!isExploring() || exploreBaseSnapshotData === null) {
-      return false
-    }
-
-    rememberFailedExploreIfNeeded()
-
-    currentSudoku = createSudokuFromJSON(exploreBaseSnapshotData)
-
-    gameMode = 'normal'
-    exploreBaseSnapshotData = null
-    exploreUndoStackData = []
-    exploreRedoStackData = []
-
-    return true
-  }
-
-  /**
-   * cancelExplore 的别名。
-   *
-   * @returns {boolean} 是否成功放弃探索
-   */
-  function abandonExplore() {
-    return cancelExplore()
-  }
-
-  /**
-   * 手动把当前探索局面记为失败。
-   * 这个方法不是必须给普通用户使用，但适合调试或后续 UI 扩展。
-   *
-   * @returns {boolean} 是否记录成功
-   */
-  function markCurrentExploreAsFailed() {
-    if (!isExploring()) {
-      return false
-    }
-
-    failedExploreSignaturesData.add(getCurrentBoardSignature())
-    return true
-  }
-
-  /**
-   * 获取探索模式状态。
-   * UI 可以用这个方法显示：
-   * - 是否正在探索
-   * - 是否失败
-   * - 失败原因
-   * - 是否可以提交
-   *
-   * @returns {Object} 探索状态
-   */
-  function getExploreStatus() {
-    const failure = analyzeCurrentFailure()
-
-    if (
-      isExploring() &&
-      failure.failed &&
-      failure.reason !== 'knownFailedPath' &&
-      failure.signature
-    ) {
-      failedExploreSignaturesData.add(failure.signature)
-    }
-
-    return {
-      mode: gameMode,
-      exploring: isExploring(),
-      failed: failure.failed,
-      reason: failure.reason,
-      message: failure.message,
-      canCommit: canCommitExplore(),
-      canUndo: canUndo(),
-      canRedo: canRedo(),
-      failedPathCount: failedExploreSignaturesData.size,
-    }
-  }
-
-  /**
-   * 判断当前局面是否是已经失败过的探索路径。
-   *
-   * @returns {boolean} 是否是已知失败路径
-   */
-  function isKnownFailedExplorePath() {
-    return failedExploreSignaturesData.has(getCurrentBoardSignature())
-  }
-
-  /**
-   * 获取已失败探索路径数量。
-   *
-   * @returns {number} 失败路径数量
-   */
-  function getFailedExploreCount() {
-    return failedExploreSignaturesData.size
-  }
-
-  /**
-   * 把整个游戏状态转成 JSON。
-   *
-   * 注意：
-   * 除了 HW1 的 sudoku / undoStack / redoStack，
-   * HW2 还需要保存：
-   * - 当前模式
-   * - 探索起点
-   * - 探索历史
-   * - 失败探索路径记忆
-   *
-   * @returns {Object} 当前游戏状态 JSON
+   * @returns {Object} 当前游戏状态
    */
   function toJSON() {
     return {
       sudoku: currentSudoku.toJSON(),
-
       undoStack: copySnapshotList(undoStackData),
       redoStack: copySnapshotList(redoStackData),
-
-      mode: gameMode,
-      exploreBaseSnapshot:
-        exploreBaseSnapshotData === null ? null : deepCopy(exploreBaseSnapshotData),
-      exploreUndoStack: copySnapshotList(exploreUndoStackData),
-      exploreRedoStack: copySnapshotList(exploreRedoStackData),
-
-      failedExploreSignatures: Array.from(failedExploreSignaturesData),
+      failedBoardKeys: getFailedBoardKeys(),
+      exploration: explorationData
+        ? {
+            sudoku: explorationData.sudoku.toJSON(),
+            undoStack: copySnapshotList(explorationData.undoStack),
+            redoStack: copySnapshotList(explorationData.redoStack),
+            base: deepCopy(explorationData.base),
+          }
+        : null,
     }
   }
 
   /**
-   * 返回当前游戏的字符串描述。
-   * 主要用于调试。
+   * 返回当前游戏的可读描述。
    *
    * @returns {string} 游戏状态字符串
    */
   function toString() {
+    const status = getExploreStatus()
+
     return [
       '[Game]',
-      `mode=${gameMode}`,
+      `mode=${status.mode}`,
       `canUndo=${canUndo()}`,
       `canRedo=${canRedo()}`,
-      `failedExploreCount=${failedExploreSignaturesData.size}`,
-      currentSudoku.toString(),
+      `exploreFailed=${status.failed}`,
+      getActiveState().sudoku.toString(),
     ].join('\n')
   }
 
   return {
     getSudoku,
-
     guess,
     undo,
     redo,
     canUndo,
     canRedo,
-
-    getMode,
-    isExploring,
-
-    getCandidates,
-    getHintForCell,
-    getNextHint,
-    getCandidateMap,
-    applyNextHint,
-
-    startExplore,
     enterExplore,
-    resetExploreToStart,
-    canCommitExplore,
+    startExplore: enterExplore,
+    beginExplore: enterExplore,
     commitExplore,
-    cancelExplore,
-    abandonExplore,
-
+    commitExploration: commitExplore,
+    discardExplore,
+    discardExploration: discardExplore,
+    isExploring,
+    isExploreFailed,
     getExploreStatus,
-    markCurrentExploreAsFailed,
-    isKnownFailedExplorePath,
-    getFailedExploreCount,
-
+    getCandidates,
+    getHint,
+    getFailedBoardKeys,
     toJSON,
     toString,
   }
 }
 
 /**
- * 创建一个新的游戏对象。
+ * 创建一个新的 Game 对象。
  *
- * @param {Object} options 配置对象
- * @param {Object} options.sudoku 初始数独对象
+ * @param {{sudoku: Object}} options 配置对象
  * @returns {Object} Game 对象
  */
 export function createGame({ sudoku }) {
@@ -735,12 +447,9 @@ export function createGame({ sudoku }) {
 }
 
 /**
- * 根据 JSON 数据恢复一个游戏对象。
+ * 根据 JSON 数据恢复 Game 对象。
  *
- * 兼容 HW1 的旧 JSON：
- * 如果没有 HW2 的 explore 字段，也能正常恢复。
- *
- * @param {Object} json 保存下来的游戏 JSON
+ * @param {Object} json 保存下来的游戏数据
  * @returns {Object} Game 对象
  */
 export function createGameFromJSON(json) {
@@ -750,22 +459,9 @@ export function createGameFromJSON(json) {
 
   return createGameInternal({
     sudoku: createSudokuFromJSON(json.sudoku),
-
     undoStack: Array.isArray(json.undoStack) ? json.undoStack : [],
     redoStack: Array.isArray(json.redoStack) ? json.redoStack : [],
-
-    mode: json.mode === 'explore' ? 'explore' : 'normal',
-    exploreBaseSnapshot: json.exploreBaseSnapshot || null,
-    exploreUndoStack: Array.isArray(json.exploreUndoStack)
-      ? json.exploreUndoStack
-      : [],
-    exploreRedoStack: Array.isArray(json.exploreRedoStack)
-      ? json.exploreRedoStack
-      : [],
-
-    failedExploreSignatures: Array.isArray(json.failedExploreSignatures)
-      ? json.failedExploreSignatures
-      : [],
+    failedBoardKeys: Array.isArray(json.failedBoardKeys) ? json.failedBoardKeys : [],
+    exploration: json.exploration || null,
   })
-}
 }
